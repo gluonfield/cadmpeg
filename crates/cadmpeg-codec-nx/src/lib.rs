@@ -88,6 +88,10 @@ pub(crate) mod nurbs;
 pub(crate) mod om;
 pub(crate) mod om_tokens;
 pub(crate) mod parasolid;
+mod standalone;
+pub(crate) mod sch13006;
+pub(crate) mod sch13006_periodic;
+pub(crate) mod text_transmit;
 pub(crate) mod topology;
 mod vec3_at;
 
@@ -96,6 +100,7 @@ pub mod fuzz;
 
 #[doc(hidden)]
 pub use evaluation::{saved_body_census_evidence, BodyCensusEvidence};
+pub use standalone::ParasolidCodec;
 
 use std::collections::BTreeMap;
 

@@ -50,7 +50,7 @@ pub fn write_step(
     w: &mut (impl Write + ?Sized),
     opts: &StepWriteOptions,
 ) -> Result<ExportReport, StepError> {
-    let mut b = Builder::new(ir, opts.schema);
+    let mut b = Builder::new(ir, opts.schema)?;
     b.build();
     let report = b.finish_report();
     let lines = b.emitter.into_lines();
@@ -114,8 +114,257 @@ struct ColorSpec<'a> {
 
 struct LoopSegment {
     coedge_id: String,
-    start_vertex: String,
-    end_vertex: String,
+    edge_start_vertex: String,
+    edge_end_vertex: String,
+    sense_orientation: bool,
+}
+
+struct OrderedLoopCoedge {
+    coedge_id: String,
+    orientation: bool,
+}
+
+const SCH13006_NATIVE_NAMESPACE: &str = "parasolid";
+const SCH13006_NATIVE_VERSION: u32 = 1;
+const SCH13006_STEP_ORIENTATION_ARENA: &str = "sch13006_step_edge_orientation";
+const SCH13006_STEP_ORIENTED_EDGE_OVERRIDE_ARENA: &str =
+    "sch13006_step_oriented_edge_override";
+const SCH13006_PLANE_LIFT_CLASS: &str = "plane_lift_source_orientation";
+const SCH13006_COMPLEX_CIRCLE_CLASS: &str =
+    "complex_periodic_reconstruction_plus_two_edge_planar_radial_ownership";
+const SCH13006_SHARED_CIRCLE_OVERRIDE_CLASS: &str =
+    "shared_circle_planar_radial_cross_ownership";
+
+/// Read producer-owned STEP EDGE_CURVE orientation decisions.
+///
+/// The neutral CADIR edge endpoints, parameter ranges, and coedge senses remain
+/// format-neutral.  This arena carries only source-native STEP orientation
+/// provenance retained by the SCH_13006 decoder/reconstructor.
+fn sch13006_edge_curve_same_sense_false(
+    ir: &CadIr,
+) -> Result<BTreeSet<String>, StepError> {
+    let Some(namespace) = ir.native.namespace(SCH13006_NATIVE_NAMESPACE) else {
+        return Ok(BTreeSet::new());
+    };
+    let Some(records) = namespace.arenas.get(SCH13006_STEP_ORIENTATION_ARENA) else {
+        return Ok(BTreeSet::new());
+    };
+
+    if namespace.version != SCH13006_NATIVE_VERSION {
+        return Err(StepError::Unsupported(format!(
+            "SCH13006 STEP orientation namespace version mismatch expected={} actual={}",
+            SCH13006_NATIVE_VERSION, namespace.version
+        )));
+    }
+
+    let edge_ids = ir
+        .model
+        .edges
+        .iter()
+        .map(|edge| edge.id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    let mut selected = BTreeSet::<String>::new();
+    let mut plane_lift_count = 0usize;
+    let mut complex_circle_count = 0usize;
+
+    for record in records {
+        let edge = record
+            .field("edge")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                StepError::Unsupported(format!(
+                    "SCH13006 STEP orientation record '{}' has no string edge field",
+                    record.id()
+                ))
+            })?;
+
+        let class = record
+            .field("class")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                StepError::Unsupported(format!(
+                    "SCH13006 STEP orientation record '{}' has no string class field",
+                    record.id()
+                ))
+            })?;
+
+        let same_sense = record
+            .field("same_sense")
+            .and_then(|value| value.as_bool())
+            .ok_or_else(|| {
+                StepError::Unsupported(format!(
+                    "SCH13006 STEP orientation record '{}' has no boolean same_sense field",
+                    record.id()
+                ))
+            })?;
+
+        if same_sense {
+            return Err(StepError::Unsupported(format!(
+                "SCH13006 STEP orientation record '{}' must retain only same_sense=false decisions",
+                record.id()
+            )));
+        }
+
+        match class.as_str() {
+            SCH13006_PLANE_LIFT_CLASS => plane_lift_count += 1,
+            SCH13006_COMPLEX_CIRCLE_CLASS => complex_circle_count += 1,
+            _ => {
+                return Err(StepError::Unsupported(format!(
+                    "SCH13006 STEP orientation record '{}' has unsupported class '{}'",
+                    record.id(), class
+                )));
+            }
+        }
+
+        if !edge_ids.contains(edge.as_str()) {
+            return Err(StepError::Unsupported(format!(
+                "SCH13006 STEP orientation record '{}' references missing edge '{}'",
+                record.id(), edge
+            )));
+        }
+
+        if !selected.insert(edge.clone()) {
+            return Err(StepError::Unsupported(format!(
+                "SCH13006 STEP orientation edge '{}' occurs more than once",
+                edge
+            )));
+        }
+    }
+
+    if plane_lift_count != 96
+        || complex_circle_count != 8
+        || selected.len() != 104
+    {
+        return Err(StepError::Unsupported(format!(
+            "SCH13006 STEP orientation contract drift planeLift={} complexCircle={} total={} expected=96/8/104",
+            plane_lift_count,
+            complex_circle_count,
+            selected.len()
+        )));
+    }
+
+    Ok(selected)
+}
+
+fn sch13006_oriented_edge_overrides(
+    ir: &CadIr,
+) -> Result<HashMap<String, String>, StepError> {
+    let Some(namespace) = ir.native.namespace(SCH13006_NATIVE_NAMESPACE) else {
+        return Ok(HashMap::new());
+    };
+    let Some(records) = namespace
+        .arenas
+        .get(SCH13006_STEP_ORIENTED_EDGE_OVERRIDE_ARENA)
+    else {
+        return Ok(HashMap::new());
+    };
+
+    if namespace.version != SCH13006_NATIVE_VERSION {
+        return Err(StepError::Unsupported(format!(
+            "SCH13006 STEP oriented-edge override namespace version mismatch expected={} actual={}",
+            SCH13006_NATIVE_VERSION, namespace.version
+        )));
+    }
+
+    let coedges = ir
+        .model
+        .coedges
+        .iter()
+        .map(|coedge| (coedge.id.as_str(), coedge))
+        .collect::<HashMap<_, _>>();
+    let edge_ids = ir
+        .model
+        .edges
+        .iter()
+        .map(|edge| edge.id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    let mut overrides = HashMap::<String, String>::new();
+
+    for record in records {
+        let coedge = record
+            .field("coedge")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                StepError::Unsupported(format!(
+                    "SCH13006 STEP oriented-edge override record '{}' has no string coedge field",
+                    record.id()
+                ))
+            })?;
+
+        let edge = record
+            .field("edge")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                StepError::Unsupported(format!(
+                    "SCH13006 STEP oriented-edge override record '{}' has no string edge field",
+                    record.id()
+                ))
+            })?;
+
+        let class = record
+            .field("class")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                StepError::Unsupported(format!(
+                    "SCH13006 STEP oriented-edge override record '{}' has no string class field",
+                    record.id()
+                ))
+            })?;
+
+        if class != SCH13006_SHARED_CIRCLE_OVERRIDE_CLASS {
+            return Err(StepError::Unsupported(format!(
+                "SCH13006 STEP oriented-edge override record '{}' has unsupported class '{}'",
+                record.id(),
+                class
+            )));
+        }
+
+        let Some(source_coedge) = coedges.get(coedge.as_str()).copied() else {
+            return Err(StepError::Unsupported(format!(
+                "SCH13006 STEP oriented-edge override record '{}' references missing coedge '{}'",
+                record.id(),
+                coedge
+            )));
+        };
+
+        if !edge_ids.contains(edge.as_str()) {
+            return Err(StepError::Unsupported(format!(
+                "SCH13006 STEP oriented-edge override record '{}' references missing edge '{}'",
+                record.id(),
+                edge
+            )));
+        }
+
+        if source_coedge.edge.as_str() == edge {
+            return Err(StepError::Unsupported(format!(
+                "SCH13006 STEP oriented-edge override record '{}' is a no-op on coedge '{}'",
+                record.id(),
+                coedge
+            )));
+        }
+
+        if let Some(previous) = overrides.insert(coedge.clone(), edge.clone()) {
+            if previous != edge {
+                return Err(StepError::Unsupported(format!(
+                    "SCH13006 STEP oriented-edge override ambiguity coedge='{}' first='{}' second='{}'",
+                    coedge,
+                    previous,
+                    edge
+                )));
+            }
+        }
+    }
+
+    if overrides.len() != 2 {
+        return Err(StepError::Unsupported(format!(
+            "SCH13006 STEP oriented-edge override count drift expected=2 actual={}",
+            overrides.len()
+        )));
+    }
+
+    Ok(overrides)
 }
 
 pub(crate) struct Builder<'a> {
@@ -139,6 +388,8 @@ pub(crate) struct Builder<'a> {
     procedural_surfaces: HashMap<&'a str, &'a ProceduralSurface>,
     procedural_curves: HashMap<&'a str, &'a ProceduralCurve>,
     edge_coedges: HashMap<&'a str, Vec<(&'a str, &'a str)>>,
+    edge_curve_same_sense_false: BTreeSet<String>,
+    oriented_edge_overrides: HashMap<String, String>,
 
     surface_refs: HashMap<String, Ref>,
     curve_refs: HashMap<String, Ref>,
@@ -194,7 +445,7 @@ pub(crate) struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    pub(crate) fn new(ir: &'a CadIr, schema: StepSchema) -> Self {
+    pub(crate) fn new(ir: &'a CadIr, schema: StepSchema) -> Result<Self, StepError> {
         let loop_surfaces = ir
             .model
             .faces
@@ -233,7 +484,12 @@ impl<'a> Builder<'a> {
                     .push((pcurve.pcurve.as_str(), *surface));
             }
         }
-        Builder {
+        let edge_curve_same_sense_false =
+            sch13006_edge_curve_same_sense_false(ir)?;
+        let oriented_edge_overrides =
+            sch13006_oriented_edge_overrides(ir)?;
+
+        Ok(Builder {
             ir,
             schema,
             emitter: Emitter::new(),
@@ -303,6 +559,8 @@ impl<'a> Builder<'a> {
                 .map(|curve| (curve.curve.as_str(), curve))
                 .collect(),
             edge_coedges,
+            edge_curve_same_sense_false,
+            oriented_edge_overrides,
             surface_refs: HashMap::new(),
             curve_refs: HashMap::new(),
             edge_refs: HashMap::new(),
@@ -342,7 +600,7 @@ impl<'a> Builder<'a> {
             angle_unit: None,
             ratio_unit: None,
             geometry_emission_depth: 0,
-        }
+        })
     }
 
     fn loss(&mut self, code: StepLossCode, message: String) {
@@ -1852,7 +2110,9 @@ impl<'a> Builder<'a> {
         // ADVANCED_FACE: STEP requires a real surface. Skip it and aggregate the
         // loss rather than fabricate placeholder geometry.
         if let Some(surf) = self.surfaces.get(surface_id.as_str()) {
-            if !geometry::surface_is_supported(&surf.geometry) {
+            if !self.procedural_surfaces.contains_key(surface_id.as_str())
+                && !geometry::surface_is_supported(&surf.geometry)
+            {
                 self.unknown_surface_faces.insert(face_id.to_string());
                 return None;
             }
@@ -1952,10 +2212,11 @@ impl<'a> Builder<'a> {
             };
             return Some(self.emitter.emit("VERTEX_LOOP", &format!("'',{vertex}")));
         }
-        let coedge_ids = self.ordered_loop_coedges(loop_id, lp)?;
+        let ordered_coedges = self.ordered_loop_coedges(loop_id, lp)?;
         let mut oe_refs = Vec::new();
-        for cid in &coedge_ids {
-            let Some(coedge) = self.coedges.get(cid.as_str()).copied() else {
+        for ordered in &ordered_coedges {
+            let cid = ordered.coedge_id.as_str();
+            let Some(coedge) = self.coedges.get(cid).copied() else {
                 self.topology_relation_loss(
                     format!("loop:{loop_id}:coedge:{cid}"),
                     StepLossCode::LoopCoedgeRecordMissing,
@@ -1963,14 +2224,18 @@ impl<'a> Builder<'a> {
                 );
                 return None;
             };
-            let orientation = matches!(coedge.sense, Sense::Forward);
-            let Some(edge_ref) = self.emit_edge(coedge.edge.as_str()) else {
+            let orientation = ordered.orientation;
+            let step_edge_id = self
+                .oriented_edge_overrides
+                .get(cid)
+                .cloned()
+                .unwrap_or_else(|| coedge.edge.to_string());
+            let Some(edge_ref) = self.emit_edge(step_edge_id.as_str()) else {
                 self.topology_relation_loss(
-                    format!("loop:{loop_id}:edge:{}", coedge.edge),
+                    format!("loop:{loop_id}:edge:{step_edge_id}"),
                     StepLossCode::LoopEdgeNotWritable,
                     format!(
-                        "loop {loop_id} omitted edge {} because the edge is not writable",
-                        coedge.edge
+                        "loop {loop_id} omitted edge {step_edge_id} because the edge is not writable"
                     ),
                 );
                 return None;
@@ -1995,7 +2260,11 @@ impl<'a> Builder<'a> {
         )
     }
 
-    fn ordered_loop_coedges(&mut self, loop_id: &str, lp: &Loop) -> Option<Vec<String>> {
+    fn ordered_loop_coedges(
+        &mut self,
+        loop_id: &str,
+        lp: &Loop,
+    ) -> Option<Vec<OrderedLoopCoedge>> {
         let mut segments = Vec::with_capacity(lp.coedges.len());
         let mut seen = BTreeSet::new();
 
@@ -2011,6 +2280,7 @@ impl<'a> Builder<'a> {
                 );
                 return None;
             }
+
             let Some(coedge) = self.coedges.get(coedge_key).copied() else {
                 self.topology_relation_loss(
                     format!("loop:{loop_id}:coedge:{coedge_id}"),
@@ -2021,6 +2291,7 @@ impl<'a> Builder<'a> {
                 );
                 return None;
             };
+
             let edge_key = coedge.edge.as_str();
             let Some(edge) = self.edges.get(edge_key).copied() else {
                 self.topology_relation_loss(
@@ -2030,6 +2301,7 @@ impl<'a> Builder<'a> {
                 );
                 return None;
             };
+
             let Some(curve_id) = edge.curve.as_ref() else {
                 self.curveless_edges.insert(edge_key.to_string());
                 self.topology_relation_loss(
@@ -2039,6 +2311,7 @@ impl<'a> Builder<'a> {
                 );
                 continue;
             };
+
             let Some(curve) = self.curves.get(curve_id.as_str()).copied() else {
                 self.topology_relation_loss(
                     format!("edge:{edge_key}:curve:{curve_id}"),
@@ -2047,6 +2320,7 @@ impl<'a> Builder<'a> {
                 );
                 continue;
             };
+
             if !geometry::curve_is_supported(&curve.geometry) {
                 self.curveless_edges.insert(edge_key.to_string());
                 self.topology_relation_loss(
@@ -2056,33 +2330,16 @@ impl<'a> Builder<'a> {
                 );
                 continue;
             }
-            let (start_vertex, end_vertex) = match coedge.sense {
-                Sense::Forward => (&edge.start, &edge.end),
-                Sense::Reversed => (&edge.end, &edge.start),
-            };
+
             segments.push(LoopSegment {
                 coedge_id: coedge_id.0.clone(),
-                start_vertex: start_vertex.0.clone(),
-                end_vertex: end_vertex.0.clone(),
+                edge_start_vertex: edge.start.0.clone(),
+                edge_end_vertex: edge.end.0.clone(),
+                sense_orientation: matches!(coedge.sense, Sense::Forward),
             });
         }
 
-        let mut outgoing: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut incoming: HashMap<&str, usize> = HashMap::new();
-        for (index, segment) in segments.iter().enumerate() {
-            outgoing
-                .entry(segment.start_vertex.clone())
-                .or_default()
-                .push(index);
-            *incoming.entry(segment.end_vertex.as_str()).or_default() += 1;
-        }
-        if segments.iter().any(|segment| {
-            outgoing.get(&segment.start_vertex).map_or(0, Vec::len)
-                != incoming
-                    .get(segment.start_vertex.as_str())
-                    .copied()
-                    .unwrap_or(0)
-        }) {
+        if segments.is_empty() {
             self.topology_relation_loss(
                 format!("loop:{loop_id}:continuity"),
                 StepLossCode::LoopNoContinuousOrdering,
@@ -2091,32 +2348,204 @@ impl<'a> Builder<'a> {
             return None;
         }
 
-        // The IR coedge list and its next/previous links are not sufficient to
-        // establish the STEP path order. Build an Eulerian circuit from the
-        // oriented edge endpoints instead; this also handles repeated vertices
-        // without choosing a geometric edge by position in the source list.
-        for candidates in outgoing.values_mut() {
-            candidates.reverse();
+        // Preserve explicit CADIR loop topology whenever the stored coedge order
+        // already forms a continuous cycle.  Only the STEP ORIENTED_EDGE
+        // traversal flag is derived here; the coedge -> edge identity is never
+        // re-solved from a graph.  This is essential when two topologically
+        // distinct edges share identical geometry and reversed endpoints.
+        if segments.len() == lp.coedges.len() {
+            let first_preferred = segments
+                .first()
+                .map(|segment| segment.sense_orientation)
+                .unwrap_or(true);
+            let mut stored_candidates = Vec::<Vec<OrderedLoopCoedge>>::new();
+
+            for first_orientation in [first_preferred, !first_preferred] {
+                let first = &segments[0];
+                let first_start = if first_orientation {
+                    first.edge_start_vertex.clone()
+                } else {
+                    first.edge_end_vertex.clone()
+                };
+                let mut current_vertex = if first_orientation {
+                    first.edge_end_vertex.clone()
+                } else {
+                    first.edge_start_vertex.clone()
+                };
+                let mut ordered = vec![OrderedLoopCoedge {
+                    coedge_id: first.coedge_id.clone(),
+                    orientation: first_orientation,
+                }];
+                let mut continuous = true;
+
+                for segment in segments.iter().skip(1) {
+                    let orientation = if segment.edge_start_vertex == current_vertex {
+                        true
+                    } else if segment.edge_end_vertex == current_vertex {
+                        false
+                    } else {
+                        continuous = false;
+                        break;
+                    };
+
+                    current_vertex = if orientation {
+                        segment.edge_end_vertex.clone()
+                    } else {
+                        segment.edge_start_vertex.clone()
+                    };
+                    ordered.push(OrderedLoopCoedge {
+                        coedge_id: segment.coedge_id.clone(),
+                        orientation,
+                    });
+                }
+
+                if continuous && current_vertex == first_start {
+                    stored_candidates.push(ordered);
+                }
+            }
+
+            if let Some(ordered) = stored_candidates.into_iter().next() {
+                return Some(ordered);
+            }
         }
-        let first_start = segments.first()?.start_vertex.clone();
-        let mut vertex_stack = vec![first_start.clone()];
-        let mut edge_stack = Vec::new();
-        let mut circuit = Vec::with_capacity(segments.len());
-        while let Some(vertex) = vertex_stack.last().cloned() {
-            let next_edge = outgoing.get_mut(&vertex).and_then(Vec::pop);
-            if let Some(edge_index) = next_edge {
-                vertex_stack.push(segments[edge_index].end_vertex.clone());
-                edge_stack.push(edge_index);
+
+        // Preserve the legacy path exactly when coedge.sense already defines
+        // a complete directed Euler circuit.
+        let mut outgoing: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut incoming: HashMap<String, usize> = HashMap::new();
+
+        for (index, segment) in segments.iter().enumerate() {
+            let (start_vertex, end_vertex) = if segment.sense_orientation {
+                (&segment.edge_start_vertex, &segment.edge_end_vertex)
             } else {
-                vertex_stack.pop();
-                if let Some(edge_index) = edge_stack.pop() {
-                    circuit.push(edge_index);
+                (&segment.edge_end_vertex, &segment.edge_start_vertex)
+            };
+
+            outgoing
+                .entry(start_vertex.clone())
+                .or_default()
+                .push(index);
+
+            *incoming.entry(end_vertex.clone()).or_default() += 1;
+        }
+
+        let directed_balanced = segments.iter().all(|segment| {
+            let start_vertex = if segment.sense_orientation {
+                segment.edge_start_vertex.as_str()
+            } else {
+                segment.edge_end_vertex.as_str()
+            };
+
+            outgoing.get(start_vertex).map_or(0, Vec::len)
+                == incoming.get(start_vertex).copied().unwrap_or(0)
+        });
+
+        if directed_balanced {
+            let mut directed_outgoing = outgoing;
+
+            for candidates in directed_outgoing.values_mut() {
+                candidates.reverse();
+            }
+
+            let first_start = if segments.first()?.sense_orientation {
+                segments.first()?.edge_start_vertex.clone()
+            } else {
+                segments.first()?.edge_end_vertex.clone()
+            };
+
+            let mut vertex_stack = vec![first_start.clone()];
+            let mut edge_stack = Vec::new();
+            let mut circuit = Vec::with_capacity(segments.len());
+
+            while let Some(vertex) = vertex_stack.last().cloned() {
+                let next_edge = directed_outgoing.get_mut(&vertex).and_then(Vec::pop);
+
+                if let Some(edge_index) = next_edge {
+                    let segment = &segments[edge_index];
+                    let end_vertex = if segment.sense_orientation {
+                        segment.edge_end_vertex.clone()
+                    } else {
+                        segment.edge_start_vertex.clone()
+                    };
+
+                    vertex_stack.push(end_vertex);
+                    edge_stack.push(edge_index);
+                } else {
+                    vertex_stack.pop();
+
+                    if let Some(edge_index) = edge_stack.pop() {
+                        circuit.push(edge_index);
+                    }
+                }
+            }
+
+            circuit.reverse();
+
+            if circuit.len() == segments.len() {
+                if let Some(first_index) = circuit.iter().position(|index| *index == 0) {
+                    circuit.rotate_left(first_index);
+                }
+
+                let mut current_vertex = first_start.as_str();
+                let mut continuous = true;
+
+                for edge_index in &circuit {
+                    let segment = &segments[*edge_index];
+
+                    let (start_vertex, end_vertex) = if segment.sense_orientation {
+                        (
+                            segment.edge_start_vertex.as_str(),
+                            segment.edge_end_vertex.as_str(),
+                        )
+                    } else {
+                        (
+                            segment.edge_end_vertex.as_str(),
+                            segment.edge_start_vertex.as_str(),
+                        )
+                    };
+
+                    if start_vertex != current_vertex {
+                        continuous = false;
+                        break;
+                    }
+
+                    current_vertex = end_vertex;
+                }
+
+                if continuous && current_vertex == first_start {
+                    return Some(
+                        circuit
+                            .into_iter()
+                            .map(|index| OrderedLoopCoedge {
+                                coedge_id: segments[index].coedge_id.clone(),
+                                orientation: segments[index].sense_orientation,
+                            })
+                            .collect(),
+                    );
                 }
             }
         }
-        circuit.reverse();
 
-        if circuit.len() != segments.len() {
+        // Fallback: coedge.sense is an incidence/radial sense, not a STEP path
+        // direction. Treat every underlying EDGE_CURVE as an undirected graph
+        // edge and derive the STEP traversal orientation from an undirected
+        // Euler circuit. This preserves the CADIR sense contract while giving
+        // ORIENTED_EDGE the actual boundary traversal direction.
+        let mut adjacency: HashMap<String, Vec<(usize, bool, String)>> = HashMap::new();
+
+        for (index, segment) in segments.iter().enumerate() {
+            adjacency
+                .entry(segment.edge_start_vertex.clone())
+                .or_default()
+                .push((index, true, segment.edge_end_vertex.clone()));
+
+            adjacency
+                .entry(segment.edge_end_vertex.clone())
+                .or_default()
+                .push((index, false, segment.edge_start_vertex.clone()));
+        }
+
+        if adjacency.values().any(|entries| entries.len() % 2 != 0) {
             self.topology_relation_loss(
                 format!("loop:{loop_id}:continuity"),
                 StepLossCode::LoopNoContinuousOrdering,
@@ -2125,13 +2554,89 @@ impl<'a> Builder<'a> {
             return None;
         }
 
-        if let Some(first_index) = circuit.iter().position(|index| *index == 0) {
-            circuit.rotate_left(first_index);
+        for candidates in adjacency.values_mut() {
+            candidates.reverse();
         }
-        let mut current_vertex = segments.first()?.start_vertex.as_str();
-        for edge_index in &circuit {
+
+        let first_vertex = segments.first()?.edge_start_vertex.clone();
+        let mut used = vec![false; segments.len()];
+        let mut vertex_stack = vec![first_vertex];
+        let mut edge_stack: Vec<(usize, bool)> = Vec::new();
+        let mut circuit: Vec<(usize, bool)> = Vec::with_capacity(segments.len());
+
+        while let Some(vertex) = vertex_stack.last().cloned() {
+            let mut next_edge = None;
+
+            if let Some(candidates) = adjacency.get_mut(&vertex) {
+                while let Some((edge_index, orientation, next_vertex)) = candidates.pop() {
+                    if used[edge_index] {
+                        continue;
+                    }
+
+                    next_edge = Some((edge_index, orientation, next_vertex));
+                    break;
+                }
+            }
+
+            if let Some((edge_index, orientation, next_vertex)) = next_edge {
+                used[edge_index] = true;
+                vertex_stack.push(next_vertex);
+                edge_stack.push((edge_index, orientation));
+            } else {
+                vertex_stack.pop();
+
+                if let Some(edge) = edge_stack.pop() {
+                    circuit.push(edge);
+                }
+            }
+        }
+
+        circuit.reverse();
+
+        if circuit.len() != segments.len() || used.iter().any(|used| !*used) {
+            self.topology_relation_loss(
+                format!("loop:{loop_id}:continuity"),
+                StepLossCode::LoopNoContinuousOrdering,
+                format!("loop {loop_id} has no continuous vertex-to-vertex coedge ordering"),
+            );
+            return None;
+        }
+
+        let Some((first_index, first_orientation)) = circuit.first().copied() else {
+            self.topology_relation_loss(
+                format!("loop:{loop_id}:continuity"),
+                StepLossCode::LoopNoContinuousOrdering,
+                format!("loop {loop_id} has no continuous vertex-to-vertex coedge ordering"),
+            );
+            return None;
+        };
+
+        let first_segment = &segments[first_index];
+
+        let first_start = if first_orientation {
+            first_segment.edge_start_vertex.clone()
+        } else {
+            first_segment.edge_end_vertex.clone()
+        };
+
+        let mut current_vertex = first_start.as_str();
+
+        for (edge_index, orientation) in &circuit {
             let segment = &segments[*edge_index];
-            if segment.start_vertex != current_vertex {
+
+            let (start_vertex, end_vertex) = if *orientation {
+                (
+                    segment.edge_start_vertex.as_str(),
+                    segment.edge_end_vertex.as_str(),
+                )
+            } else {
+                (
+                    segment.edge_end_vertex.as_str(),
+                    segment.edge_start_vertex.as_str(),
+                )
+            };
+
+            if start_vertex != current_vertex {
                 self.topology_relation_loss(
                     format!("loop:{loop_id}:continuity"),
                     StepLossCode::LoopNoContinuousOrdering,
@@ -2139,8 +2644,10 @@ impl<'a> Builder<'a> {
                 );
                 return None;
             }
-            current_vertex = segment.end_vertex.as_str();
+
+            current_vertex = end_vertex;
         }
+
         if current_vertex != first_start {
             self.topology_relation_loss(
                 format!("loop:{loop_id}:continuity"),
@@ -2153,10 +2660,14 @@ impl<'a> Builder<'a> {
         Some(
             circuit
                 .into_iter()
-                .map(|index| segments[index].coedge_id.clone())
+                .map(|(index, orientation)| OrderedLoopCoedge {
+                    coedge_id: segments[index].coedge_id.clone(),
+                    orientation,
+                })
                 .collect(),
         )
     }
+
 
     fn emit_edge(&mut self, edge_id: &str) -> Option<Ref> {
         if let Some(r) = self.edge_refs.get(edge_id) {
@@ -2231,19 +2742,88 @@ impl<'a> Builder<'a> {
                 self.unwritten_pcurve_carriers.insert(pcurve_id.to_string());
             }
         }
+
+        let bounded_curve =
+            if let Some(
+                [
+                    start,
+                    end,
+                ]
+            ) =
+                edge.param_range
+            {
+                if !start.is_finite() ||
+                    !end.is_finite() ||
+                    start == end
+                {
+                    self.topology_relation_loss(
+                        format!(
+                            "edge:{edge_id}:invalid-parameter-range"
+                        ),
+                        StepLossCode::EdgeCurveNotWritable,
+                        format!(
+                            "edge {edge_id} has invalid parameter range [{start},{end}]"
+                        ),
+                    );
+                    return None;
+                }
+
+                let sense =
+                    end >
+                    start;
+
+                let (
+                    trim_1,
+                    trim_2,
+                ) =
+                    if sense {
+                        (
+                            start,
+                            end,
+                        )
+                    }
+                    else {
+                        (
+                            end,
+                            start,
+                        )
+                    };
+
+                self.emitter.emit(
+                    "TRIMMED_CURVE",
+                    &format!(
+                        "'',{basis_curve},(PARAMETER_VALUE({})),(PARAMETER_VALUE({})),{},.PARAMETER.",
+                        real(trim_1),
+                        real(trim_2),
+                        if sense { ".T." } else { ".F." }
+                    ),
+                )
+            }
+            else {
+                basis_curve
+            };
+
         let curve_ref = if pcurve_refs.is_empty() {
-            basis_curve
+            bounded_curve
         } else {
             self.emitter.emit(
                 "SURFACE_CURVE",
-                &format!("'',{basis_curve},{},.CURVE_3D.", refs(&pcurve_refs)),
+                &format!("'',{bounded_curve},{},.CURVE_3D.", refs(&pcurve_refs)),
             )
         };
-        // same_sense = .T.: the edge runs start→end along the curve's own
-        // parameterization, the convention IR curves follow.
-        let r = self
-            .emitter
-            .emit("EDGE_CURVE", &format!("'',{v1},{v2},{curve_ref},.T."));
+
+        // STEP EDGE_CURVE intrinsic orientation is source-native metadata.
+        // It is intentionally independent of neutral edge direction, coedge
+        // incidence sense, and TRIMMED_CURVE parameter-range direction.
+        let same_sense = if self.edge_curve_same_sense_false.contains(edge_id) {
+            ".F."
+        } else {
+            ".T."
+        };
+        let r = self.emitter.emit(
+            "EDGE_CURVE",
+            &format!("'',{v1},{v2},{curve_ref},{same_sense}"),
+        );
         self.edge_refs.insert(edge_id.to_string(), r);
         Some(r)
     }
@@ -2364,6 +2944,20 @@ impl<'a> Builder<'a> {
                     self.emitter
                         .emit("SURFACE_OF_REVOLUTION", &format!("'',{directrix},{axis}")),
                 )
+            }
+            ProceduralSurfaceDefinition::Offset {
+                support,
+                distance,
+                u_sense: None,
+                v_sense: None,
+                extension_flags,
+                revision_form: None,
+            } if extension_flags.is_empty() => {
+                let support = self.emit_surface(support.as_str())?;
+                Some(self.emitter.emit(
+                    "OFFSET_SURFACE",
+                    &format!("'',{support},{},{}", real(*distance), logical(None)),
+                ))
             }
             ProceduralSurfaceDefinition::ParallelOffset {
                 support,
@@ -4003,7 +4597,13 @@ impl<'a> Builder<'a> {
             .native
             .loss_counts()
             .iter()
-            .filter(|loss| loss.kind != "unknowns")
+            .filter(|loss| {
+                loss.kind != "unknowns"
+                    && !(
+                        loss.format == SCH13006_NATIVE_NAMESPACE
+                            && loss.kind == SCH13006_STEP_ORIENTATION_ARENA
+                    )
+            })
             .map(|loss| loss.count)
             .sum();
         if source_native_records > 0 {
@@ -4048,3 +4648,5 @@ fn is_identity(rows: &[[f64; 4]; 4]) -> bool {
 pub(crate) fn is_rigid_transform(rows: &[[f64; 4]; 4]) -> bool {
     cadmpeg_ir::transform::Transform { rows: *rows }.is_proper_rigid()
 }
+
+
